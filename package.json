@@ -1,0 +1,16 @@
+{
+  "name": "reels-plus",
+  "version": "1.2.0",
+  "description": "Quality-of-life upgrades for Instagram web Reels: progress bar + optional auto-scroll.",
+  "scripts": {
+    "launch": "node scripts/load-extension.mjs",
+    "launch:reels": "node scripts/load-extension.mjs https://www.instagram.com/reels/",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["instagram", "reels", "chrome-extension"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "chrome-launcher": "^1.2.1"
+  }
+}

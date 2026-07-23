@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reels+</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="header">
+    <img src="../icons/icon32.png" alt="" class="logo" width="22" height="22" />
+    <div class="brand">
+      <h1>Reels+</h1>
+      <p class="tagline">Instagram web, leveled up</p>
+    </div>
+  </header>
+
+  <main class="body">
+    <section class="feature">
+      <label class="row toggle-row" for="progressToggle">
+        <span class="label">
+          <span class="dot" id="progressDot" aria-hidden="true"></span>
+          Progress bar
+        </span>
+        <span class="switch">
+          <input type="checkbox" id="progressToggle" />
+          <span class="slider" aria-hidden="true"></span>
+        </span>
+      </label>
+      <p class="feature-hint">Mobile-style playback bar on each Reel</p>
+    </section>
+
+    <section class="feature">
+      <label class="row toggle-row" for="autoScrollToggle">
+        <span class="label">
+          <span class="dot" id="autoScrollDot" aria-hidden="true"></span>
+          Auto-scroll
+        </span>
+        <span class="switch">
+          <input type="checkbox" id="autoScrollToggle" />
+          <span class="slider" aria-hidden="true"></span>
+        </span>
+      </label>
+      <p class="feature-hint">Advance after a Reel finishes playing</p>
+
+      <label class="row stepper-row" for="repeatInput" id="repeatRow">
+        <span class="label">
+          Play each
+          <span class="stepper">
+            <button type="button" id="dec" class="step-btn" aria-label="Decrease">−</button>
+            <input type="number" id="repeatInput" min="1" max="20" step="1" value="1" />
+            <button type="button" id="inc" class="step-btn" aria-label="Increase">+</button>
+          </span>
+          times
+        </span>
+      </label>
+    </section>
+
+    <p class="status" id="status">Checking page…</p>
+  </main>
+
+  <footer class="footer">
+    <span>Private · no tracking · MV3</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
