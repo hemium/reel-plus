@@ -24,6 +24,21 @@ DOM. Keep one product; add features as toggles.
    *(or run `npm run launch` / `npm run launch:reels` on Chrome 137+).*
 4. Open `https://www.instagram.com/reels/` and flip the toggles you want.
 
+## Releases
+
+```bash
+npm run package
+```
+
+Produces two installable zips in `dist/`:
+
+| Zip | Contents |
+|---|---|
+| `reels-plus-<ver>-full.zip` | Progress bar + auto-scroll |
+| `reels-plus-<ver>-progress.zip` | Progress bar only |
+
+Load either via `chrome://extensions` → **Load unpacked** (unzip first) or attach to a GitHub Release.
+
 ## Project Structure
 
 ```

@@ -22,6 +22,8 @@
   // Legacy guard from v1 name — avoid double-binding if an old inject lingered.
   window.__igReelsAutoScrollInjected = true;
 
+  const FEATURES = window.REELS_PLUS_FEATURES || { AUTO_SCROLL: true };
+
   // -------------------------------------------------------------------------
   // Constants & resilient selector lists
   // -------------------------------------------------------------------------
@@ -244,9 +246,13 @@
   }
 
   function applySettings(items) {
-    state.autoScroll = items.autoScroll !== undefined
-      ? !!items.autoScroll
-      : !!items[STORAGE_KEYS.LEGACY_ENABLED];
+    if (FEATURES.AUTO_SCROLL) {
+      state.autoScroll = items.autoScroll !== undefined
+        ? !!items.autoScroll
+        : !!items[STORAGE_KEYS.LEGACY_ENABLED];
+    } else {
+      state.autoScroll = false;
+    }
     state.progressBar = items.progressBar !== undefined
       ? !!items.progressBar
       : DEFAULTS.progressBar;
@@ -283,10 +289,10 @@
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'sync' && area !== 'local') return;
     let changed = false;
-    if (changes[STORAGE_KEYS.AUTO_SCROLL]) {
+    if (FEATURES.AUTO_SCROLL && changes[STORAGE_KEYS.AUTO_SCROLL]) {
       state.autoScroll = !!changes[STORAGE_KEYS.AUTO_SCROLL].newValue;
       changed = true;
-    } else if (changes[STORAGE_KEYS.LEGACY_ENABLED] && changes[STORAGE_KEYS.AUTO_SCROLL] === undefined) {
+    } else if (FEATURES.AUTO_SCROLL && changes[STORAGE_KEYS.LEGACY_ENABLED] && changes[STORAGE_KEYS.AUTO_SCROLL] === undefined) {
       state.autoScroll = !!changes[STORAGE_KEYS.LEGACY_ENABLED].newValue;
       changed = true;
     }
@@ -302,6 +308,7 @@
       }
     }
     if (changed) {
+      if (!FEATURES.AUTO_SCROLL) state.autoScroll = false;
       log('Settings updated →', {
         autoScroll: state.autoScroll,
         progressBar: state.progressBar,

@@ -5,6 +5,7 @@
   "scripts": {
     "launch": "node scripts/load-extension.mjs",
     "launch:reels": "node scripts/load-extension.mjs https://www.instagram.com/reels/",
+    "package": "node scripts/package-releases.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": ["instagram", "reels", "chrome-extension"],

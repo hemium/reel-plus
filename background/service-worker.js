@@ -3,6 +3,10 @@
  * Seeds defaults (with migration from v1 `enabled` key) and relays status.
  */
 
+importScripts(chrome.runtime.getURL('features.js'));
+
+const FEATURES = self.REELS_PLUS_FEATURES || { AUTO_SCROLL: true };
+
 const DEFAULTS = {
   autoScroll: false,
   progressBar: true,
@@ -12,10 +16,13 @@ const DEFAULTS = {
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.sync.get(null, (items) => {
     const patch = {};
+    const allowAuto = !!FEATURES.AUTO_SCROLL;
 
     // Migrate legacy `enabled` → `autoScroll`
     if (items.autoScroll === undefined) {
-      patch.autoScroll = items.enabled !== undefined ? !!items.enabled : DEFAULTS.autoScroll;
+      patch.autoScroll = allowAuto && (items.enabled !== undefined ? !!items.enabled : DEFAULTS.autoScroll);
+    } else if (!allowAuto && items.autoScroll) {
+      patch.autoScroll = false;
     }
     if (items.progressBar === undefined) patch.progressBar = DEFAULTS.progressBar;
     if (items.repeatCount === undefined) patch.repeatCount = DEFAULTS.repeatCount;

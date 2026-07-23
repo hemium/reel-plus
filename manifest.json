@@ -33,7 +33,7 @@
         "*://www.instagram.com/*",
         "*://instagram.com/*"
       ],
-      "js": ["content/content.js"],
+      "js": ["features.js", "content/content.js"],
       "run_at": "document_idle",
       "all_frames": false
     }
