@@ -1,6 +1,6 @@
 {
   "name": "reels-plus",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Quality-of-life upgrades for Instagram web Reels: progress bar + optional auto-scroll.",
   "scripts": {
     "launch": "node scripts/load-extension.mjs",

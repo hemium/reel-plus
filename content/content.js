@@ -3,7 +3,7 @@
  * ----------------------------------------------------------------------------
  * Quality-of-life upgrades for Instagram web Reels:
  *  - Progress bar (Stories-style segments, YouTube-style hover scrub)
- *  - Optional auto-advance after N full plays
+ *  - Optional auto-advance after N full plays (holds while comments are open)
  *
  * Design goals:
  *  - Features are independently toggleable.
@@ -71,6 +71,17 @@
     'div[role="button"][aria-label*="Next" i]',
   ];
 
+  // Comments panel signals (Instagram DOM drifts — prefer role/aria over classes).
+  const COMMENT_DIALOG_SELECTOR = '[role="dialog"]';
+  const COMMENT_COMPOSE_SELECTORS = [
+    'textarea[placeholder*="Add a comment" i]',
+    'textarea[aria-label*="Add a comment" i]',
+    'textarea[placeholder*="comment" i]',
+    'textarea[aria-label*="comment" i]',
+  ];
+  const COMMENT_CONTROL_EXPANDED_SELECTOR =
+    '[aria-expanded="true"] svg[aria-label*="Comment" i]';
+
   const END_THRESHOLD_SECONDS = 0.3;
   const NAV_DEBOUNCE_MS = 450;
   const LOCATION_POLL_MS = 400;
@@ -110,6 +121,11 @@
     progressScrubCleanup: null,
     /** Blocks end-detection while restarting a Reel left at EOF (#3). */
     pendingFreshStart: false,
+
+    /** True while the Reels comments panel is open. */
+    commentsOpen: false,
+    /** Play finished while comments were open — advance deferred until close. */
+    heldForComments: false,
   };
 
   let mutationObserver = null;
@@ -437,6 +453,8 @@
     state.active = true;
     state.playCount = 0;
     state.advancing = false;
+    state.commentsOpen = false;
+    state.heldForComments = false;
     log('Activating on Reels page.', {
       autoScroll: state.autoScroll,
       progressBar: state.progressBar,
@@ -445,6 +463,7 @@
     bindProgressLayoutListeners();
     attachVideoWatcher();
     setupDomObserver();
+    syncCommentsPanelState();
   }
 
   function deactivate() {
@@ -464,6 +483,8 @@
     state.playCount = 0;
     state.videoEndedFired = false;
     state.pendingFreshStart = false;
+    state.commentsOpen = false;
+    state.heldForComments = false;
   }
 
   function syncProgressUi(video) {
@@ -885,7 +906,13 @@
     const ratio = duration
       ? Math.max(0, Math.min(1, (video.currentTime || 0) / duration))
       : 0;
-    const completed = state.autoScroll ? Math.max(0, state.playCount | 0) : 0;
+    let completed = state.autoScroll ? Math.max(0, state.playCount | 0) : 0;
+    // playCount reaches repeatCount when ready to advance (or held for comments).
+    // Keep painting the last segment from the live ratio so a looped reel does
+    // not look stuck at 100% white while still playing.
+    if (fills.length > 0 && completed >= fills.length) {
+      completed = fills.length - 1;
+    }
 
     fills.forEach((fill, i) => {
       let pct = 0;
@@ -1015,6 +1042,7 @@
         if (domObserverTimer) clearTimeout(domObserverTimer);
         domObserverTimer = setTimeout(() => {
           if (!state.active) return;
+          syncCommentsPanelState();
           const prev = state.activeVideo;
           refreshActiveVideo({ resetCount: true });
           // Even if the same <video> node, Instagram may have reflowed it.
@@ -1096,6 +1124,8 @@
     const onTimeUpdate = () => {
       if (video !== state.activeVideo) return;
       clearPendingFreshStart(video);
+      // Keep the progress RAF alive across silent loops (seek without play).
+      if (state.progressBar && !video.paused && !video.ended) startProgressLoop();
       handleTimeUpdate(video);
     };
     const onEnded = () => {
@@ -1121,7 +1151,11 @@
     const onSeeked = () => {
       if (video !== state.activeVideo) return;
       clearPendingFreshStart(video);
-      if (state.progressBar) updateProgressBar(video);
+      if (state.progressBar) {
+        updateProgressBar(video);
+        // Instagram may loop a Reel via seek without a play event; restart RAF.
+        if (!video.paused && !video.ended) startProgressLoop();
+      }
     };
     const onMeta = () => {
       if (video !== state.activeVideo) return;
@@ -1260,6 +1294,11 @@
 
     if (state.playCount < state.repeatCount) {
       replayFromStart(video);
+    } else if (isCommentsOpen()) {
+      state.heldForComments = true;
+      state.commentsOpen = true;
+      log('Comments open — holding auto-advance.');
+      broadcastStatus();
     } else {
       advanceToNext();
     }
@@ -1340,6 +1379,13 @@
   function advanceToNext() {
     if (!state.autoScroll) return;
     if (state.advancing) return;
+    if (isCommentsOpen()) {
+      state.heldForComments = true;
+      state.commentsOpen = true;
+      log('Comments open — holding auto-advance.');
+      broadcastStatus();
+      return;
+    }
     state.advancing = true;
     broadcastStatus();
 
@@ -1399,6 +1445,92 @@
       } catch (_e) {}
     }
     return null;
+  }
+
+  function isElementVisible(el) {
+    if (!el || !el.isConnected) return false;
+    try {
+      const r = el.getBoundingClientRect();
+      if (r.width < 16 || r.height < 16) return false;
+      const style = window.getComputedStyle(el);
+      if (!style) return true;
+      if (style.visibility === 'hidden' || style.display === 'none') return false;
+      if (parseFloat(style.opacity || '1') === 0) return false;
+      return true;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  function isCommentsDialog(dialog) {
+    if (!dialog) return false;
+    const label = (dialog.getAttribute && dialog.getAttribute('aria-label')) || '';
+    if (/\bcomments?\b/i.test(label)) return true;
+    const text = (dialog.innerText || '').trim();
+    if (/^comments?\b/i.test(text)) return true;
+    // Dialog with a Close control + "Comments" somewhere in the body.
+    if (/\bcomments?\b/i.test(text) && dialog.querySelector('svg[aria-label*="Close" i], [aria-label="Close"]')) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * True when Instagram's Reels comments panel is open.
+   * Prefer role="dialog" + Comments heading; fall back to expanded Comment
+   * control or a visible compose field.
+   */
+  function isCommentsOpen() {
+    try {
+      const dialogs = document.querySelectorAll(COMMENT_DIALOG_SELECTOR);
+      for (const dialog of dialogs) {
+        if (isElementVisible(dialog) && isCommentsDialog(dialog)) return true;
+      }
+      if (document.querySelector(COMMENT_CONTROL_EXPANDED_SELECTOR)) return true;
+      for (const sel of COMMENT_COMPOSE_SELECTORS) {
+        const field = document.querySelector(sel);
+        if (field && isElementVisible(field)) return true;
+      }
+    } catch (_e) {}
+    return false;
+  }
+
+  function syncCommentsPanelState() {
+    const open = isCommentsOpen();
+    const wasOpen = state.commentsOpen;
+    state.commentsOpen = open;
+    if (wasOpen === open) return;
+
+    if (open) {
+      log('Comments panel opened — auto-advance will hold at end of play.');
+      return;
+    }
+
+    log('Comments panel closed.');
+    if (!state.heldForComments) return;
+    state.heldForComments = false;
+    // Do not jump immediately. Only restart if still sitting at EOF; if the
+    // Reel already looped while comments were open, keep playing and advance
+    // on the next natural ending.
+    if (state.autoScroll && state.activeVideo) {
+      if (isNearPlaybackEnd(state.activeVideo)) {
+        log('Resuming auto-scroll after comments — restarting current Reel (EOF).');
+        prepareFreshPlayback(state.activeVideo);
+      } else {
+        log('Resuming auto-scroll after comments — continuing current playback.');
+        state.videoEndedFired = false;
+        state.pendingFreshStart = false;
+        if (state.progressBar) {
+          updateProgressBar(state.activeVideo);
+          if (!state.activeVideo.paused && !state.activeVideo.ended) {
+            startProgressLoop();
+          }
+        }
+      }
+    } else {
+      state.videoEndedFired = false;
+    }
+    broadcastStatus();
   }
 
   function clickNextButton() {
