@@ -7,7 +7,8 @@
  *
  * Design goals:
  *  - Features are independently toggleable.
- *  - Event-driven (video events + MutationObserver). No aggressive polling.
+ *  - Event-driven (video events + MutationObserver), plus a light location
+ *    poll so Instagram SPA navigations are detected across the isolated world.
  *  - Resilient selectors with fallbacks (Instagram DOM changes often).
  *  - Natural advancement: real click on Next button > keyboard > scroll.
  *  - Fully removable when all features are off.
@@ -60,8 +61,11 @@
   ];
 
   const NEXT_BUTTON_SELECTORS = [
+    'button[aria-label="Navigate to next Reel"]',
     'button[aria-label="Next"]',
     'button[aria-label="Go to next video"]',
+    'button[aria-label*="Next" i]',
+    'div[role="button"][aria-label="Navigate to next Reel"]',
     'div[role="button"][aria-label="Next"]',
     'button svg[aria-label="Next"]',
     'div[role="button"][aria-label*="Next" i]',
@@ -69,6 +73,7 @@
 
   const END_THRESHOLD_SECONDS = 0.3;
   const NAV_DEBOUNCE_MS = 450;
+  const LOCATION_POLL_MS = 400;
   const ADVANCE_COOLDOWN_MS = 1200;
   const VIDEO_SETTLE_MS = 350;
   const DOM_OBSERVE_DEBOUNCE_MS = 200;
@@ -89,6 +94,7 @@
     active: false,            // monitoring on (any feature on + reels page)
 
     activeVideo: null,
+    activeReelSrc: '',
     playCount: 0,
     videoEndedFired: false,
     advancing: false,
@@ -102,11 +108,14 @@
     progressRaf: 0,
     progressScrubbing: false,
     progressScrubCleanup: null,
+    /** Blocks end-detection while restarting a Reel left at EOF (#3). */
+    pendingFreshStart: false,
   };
 
   let mutationObserver = null;
   let domObserverTimer = null;
   let navTimer = null;
+  let lastSeenHref = '';
   let progressLayoutBound = false;
   let progressLayoutRaf = 0;
   let progressSettleTimers = [];
@@ -157,16 +166,77 @@
     }
   }
 
+  function getVideoSrcKey(video) {
+    if (!video) return '';
+    try {
+      return video.currentSrc || video.src || '';
+    } catch (_e) {
+      return '';
+    }
+  }
+
+  function isMidRepeatCycle() {
+    if (!state.autoScroll) return false;
+    const target = Math.max(1, state.repeatCount | 0);
+    return state.playCount > 0 && state.playCount < target;
+  }
+
+  /** True when the bound video is a different Reel asset (not a DOM node swap). */
+  function shouldResetPlayCountForVideo(nextVideo) {
+    if (!nextVideo) return false;
+    const nextSrc = getVideoSrcKey(nextVideo);
+    const prevSrc = state.activeReelSrc || getVideoSrcKey(state.activeVideo);
+    if (nextSrc && prevSrc) {
+      if (nextSrc === prevSrc) return false;
+      return true;
+    }
+    if (isMidRepeatCycle()) return false;
+    // Finished the repeat cycle (e.g. auto-advance pending) — reset even if the
+    // next asset has not published currentSrc yet (#4 play-to-end progress bar).
+    const target = Math.max(1, state.repeatCount | 0);
+    if (state.autoScroll && state.playCount >= target) return true;
+    return !!nextSrc;
+  }
+
+  function syncActiveReelSrc(video) {
+    if (!video || video !== state.activeVideo) return;
+    const src = getVideoSrcKey(video);
+    if (src) state.activeReelSrc = src;
+  }
+
+  function resolveReplayVideo(video) {
+    const preferSrc = state.activeReelSrc || getVideoSrcKey(video);
+    if (preferSrc) state.activeReelSrc = preferSrc;
+
+    if (video && video.isConnected) {
+      const src = getVideoSrcKey(video);
+      if (!preferSrc || !src || src === preferSrc) return video;
+    }
+
+    return findReelsVideo({ preferSrc }) || video;
+  }
+
   function refreshActiveVideo(opts = {}) {
-    const { resetCount = false } = opts;
+    const { resetCount = false, allowReelChange = false } = opts;
     if (!state.active) return null;
-    const next = findReelsVideo();
+
+    const preferSrc = isMidRepeatCycle() && !allowReelChange ? state.activeReelSrc : '';
+    if (isMidRepeatCycle() && !allowReelChange && state.activeVideo && state.activeVideo.isConnected) {
+      if (state.progressBar) updateProgressBar(state.activeVideo);
+      return state.activeVideo;
+    }
+
+    const next = findReelsVideo({ preferSrc });
     if (next && next !== state.activeVideo) {
       bindVideo(next);
-      if (resetCount) resetPlayCount();
-    } else if (next && state.progressBar) {
-      // Same node, but layout may have changed (resize / reel settle).
-      updateProgressBar(next);
+      if (resetCount && shouldResetPlayCountForVideo(next)) resetPlayCount();
+    } else if (next) {
+      // Same <video> node may have swapped assets on navigation.
+      if (resetCount && shouldResetPlayCountForVideo(next)) {
+        resetPlayCount();
+      } else if (state.progressBar) {
+        updateProgressBar(next);
+      }
     }
     // Never hide solely because find() missed during a resize mid-frame —
     // keep the last binding and let settle retries re-anchor.
@@ -324,25 +394,23 @@
   }
 
   function setupNavigationObserver() {
-    const wrap = (type) => {
-      const orig = history[type];
-      history[type] = function (...args) {
-        const ret = orig.apply(this, args);
-        try {
-          window.dispatchEvent(new Event('ig-locationchange'));
-        } catch (_e) {}
-        return ret;
-      };
-    };
-    wrap('pushState');
-    wrap('replaceState');
-    window.addEventListener('popstate', () => {
-      window.dispatchEvent(new Event('ig-locationchange'));
-    });
-    window.addEventListener('ig-locationchange', onLocationChanged);
+    // popstate crosses the content-script isolated world (shared DOM events).
+    window.addEventListener('popstate', onLocationChanged);
+
+    // Instagram SPA routing (e.g. Messages → Reels) updates location via the
+    // page world's History API. Content-script wraps of history.pushState do
+    // not see those calls, and pushState never fires popstate — so we poll.
+    lastSeenHref = location.href;
+    setInterval(() => {
+      const href = location.href;
+      if (href === lastSeenHref) return;
+      lastSeenHref = href;
+      onLocationChanged();
+    }, LOCATION_POLL_MS);
   }
 
   function onLocationChanged() {
+    lastSeenHref = location.href;
     if (navTimer) clearTimeout(navTimer);
     navTimer = setTimeout(() => {
       recomputeActiveState();
@@ -359,8 +427,9 @@
     } else if (!shouldActivate && state.active) {
       deactivate();
     } else if (state.active) {
-      // Still active — feature mix may have changed.
-      syncProgressUi(state.activeVideo);
+      // URL changed between Reels (e.g. Instagram auto-advance after natural end).
+      refreshActiveVideo({ resetCount: true, allowReelChange: true });
+      syncProgressLayout({ settle: true });
     }
   }
 
@@ -391,7 +460,10 @@
     }
     state.advancing = false;
     state.activeVideo = null;
+    state.activeReelSrc = '';
     state.playCount = 0;
+    state.videoEndedFired = false;
+    state.pendingFreshStart = false;
   }
 
   function syncProgressUi(video) {
@@ -401,7 +473,10 @@
     }
     ensureProgressBar();
     rebuildProgressSegments(true);
-    if (video) updateProgressBar(video);
+    if (video) {
+      updateProgressBar(video);
+      if (!video.paused && !video.ended) startProgressLoop();
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -472,11 +547,12 @@
         }
         .fill {
           height: 100%;
-          width: 0%;
+          width: 100%;
           background: #fff;
           border-radius: 999px;
+          transform: scaleX(0);
           transform-origin: left center;
-          will-change: width;
+          will-change: transform;
         }
         .knob {
           position: absolute;
@@ -669,10 +745,7 @@
   }
 
   function destroyProgressBar() {
-    if (state.progressRaf) {
-      cancelAnimationFrame(state.progressRaf);
-      state.progressRaf = 0;
-    }
+    cancelProgressTick();
     if (typeof state.progressScrubCleanup === 'function') {
       try { state.progressScrubCleanup(); } catch (_e) {}
     }
@@ -752,16 +825,45 @@
     knob.style.left = `${x}px`;
   }
 
+  function cancelProgressTick() {
+    if (state.progressRaf) {
+      cancelAnimationFrame(state.progressRaf);
+      state.progressRaf = 0;
+    }
+  }
+
+  function progressTickLoop() {
+    state.progressRaf = 0;
+    if (!state.active || !state.progressBar || !state.activeVideo) return;
+    const video = state.activeVideo;
+    if (video.paused || video.ended) return;
+    updateProgressBar(video);
+    state.progressRaf = requestAnimationFrame(progressTickLoop);
+  }
+
+  function startProgressLoop() {
+    if (state.progressRaf) return;
+    if (!state.active || !state.progressBar || !state.activeVideo) return;
+    const video = state.activeVideo;
+    if (video.paused || video.ended) return;
+    state.progressRaf = requestAnimationFrame(progressTickLoop);
+  }
+
   function updateProgressBar(video) {
     if (!state.active || !state.progressBar) return;
+    // Ignore paints from a Reel we already unbound (stale scrub RAF / timeupdate).
+    if (video && state.activeVideo && video !== state.activeVideo) return;
+    video = video || state.activeVideo;
 
     // Self-heal only when the bound Reel has clearly left the primary slot.
     if (video && video === state.activeVideo && !isVideoPrimary(video)) {
-      const next = findReelsVideo();
-      if (next && next !== video && isVideoPrimary(next)) {
-        bindVideo(next);
-        resetPlayCount();
-        return;
+      if (!isMidRepeatCycle()) {
+        const next = findReelsVideo();
+        if (next && next !== video && isVideoPrimary(next)) {
+          bindVideo(next);
+          if (shouldResetPlayCountForVideo(next)) resetPlayCount();
+          return;
+        }
       }
       // Still connected but mid-reflow / partially off — keep updating if possible.
       if (!video.isConnected) {
@@ -790,19 +892,11 @@
       if (i < completed) pct = 100;
       else if (i === completed) pct = ratio * 100;
       else pct = 0;
-      fill.style.width = `${pct}%`;
+      fill.style.transform = `scaleX(${pct / 100})`;
     });
 
     positionProgressKnob(ratio, completed);
     positionProgressBar(video || state.activeVideo);
-  }
-
-  function scheduleProgressTick(video) {
-    if (state.progressRaf) return;
-    state.progressRaf = requestAnimationFrame(() => {
-      state.progressRaf = 0;
-      updateProgressBar(video || state.activeVideo);
-    });
   }
 
   function broadcastStatus() {
@@ -851,7 +945,12 @@
     return cx >= 0 && cx <= window.innerWidth && cy >= 0 && cy <= window.innerHeight;
   }
 
-  function findReelsVideo() {
+  function findReelsVideo(opts = {}) {
+    let preferSrc = opts.preferSrc || '';
+    if (!preferSrc && isMidRepeatCycle() && state.activeReelSrc) {
+      preferSrc = state.activeReelSrc;
+    }
+
     let candidates = [];
     for (const sel of VIDEO_SELECTORS) {
       try {
@@ -870,6 +969,8 @@
     let best = null;
     let bestScore = -1;
     for (const v of candidates) {
+      const vSrc = getVideoSrcKey(v);
+      if (preferSrc && vSrc && vSrc !== preferSrc) continue;
       if (!isVideoUsable(v) && !isLikelyInView(v)) continue;
       let score = queryVisibleArea(v);
       if (score <= 0) continue;
@@ -879,17 +980,30 @@
       if (!v.paused && !v.ended) score *= 1.5;
       // Prefer the currently bound video when scores are close (avoid flip-flop).
       if (v === state.activeVideo) score *= 1.1;
+      if (preferSrc && vSrc === preferSrc) score *= 4;
       if (score > bestScore) {
         bestScore = score;
         best = v;
       }
     }
     if (best) return best;
+
+    if (preferSrc && state.activeVideo && state.activeVideo.isConnected) {
+      const activeSrc = getVideoSrcKey(state.activeVideo);
+      if (!activeSrc || activeSrc === preferSrc) return state.activeVideo;
+    }
+
     // Prefer a primary/in-view candidate; last resort: largest connected video.
+    const filtered = preferSrc
+      ? candidates.filter((v) => {
+        const vSrc = getVideoSrcKey(v);
+        return !vSrc || vSrc === preferSrc;
+      })
+      : candidates;
     return (
-      candidates.find((v) => isVideoPrimary(v))
-      || candidates.find((v) => isLikelyInView(v))
-      || candidates.find((v) => v.isConnected && v.getBoundingClientRect().width >= 80)
+      filtered.find((v) => isVideoPrimary(v))
+      || filtered.find((v) => isLikelyInView(v))
+      || filtered.find((v) => v.isConnected && v.getBoundingClientRect().width >= 80)
       || null
     );
   }
@@ -941,15 +1055,37 @@
   function bindVideo(video) {
     if (!video) return;
     if (state.activeVideo === video) {
-      if (state.progressBar) updateProgressBar(video);
+      const src = getVideoSrcKey(video);
+      if (src && state.activeReelSrc && src !== state.activeReelSrc) {
+        state.activeReelSrc = src;
+        resetPlayCount();
+      } else if (state.progressBar) {
+        updateProgressBar(video);
+      }
       return;
     }
+
+    if (isMidRepeatCycle() && state.activeReelSrc) {
+      const nextSrc = getVideoSrcKey(video);
+      if (nextSrc && nextSrc !== state.activeReelSrc) return;
+    }
+
+    const prevSrc = getVideoSrcKey(state.activeVideo);
+    const nextSrc = getVideoSrcKey(video);
+    const sameReel = !!(nextSrc && prevSrc && nextSrc === prevSrc);
+    const preserveEndState = sameReel && isMidRepeatCycle();
+    const prevEndedFired = state.videoEndedFired;
+
+    // Cancel any pending RAF from the previous Reel before rebinding (#2).
+    cancelProgressTick();
 
     if (state.activeVideo && state.activeVideo !== video) {
       detachVideoListeners(state.activeVideo);
     }
     state.activeVideo = video;
-    state.videoEndedFired = false;
+    state.activeReelSrc = nextSrc || state.activeReelSrc;
+    state.videoEndedFired = preserveEndState ? prevEndedFired : false;
+    if (!preserveEndState) state.pendingFreshStart = false;
     // Clear a stuck scrub if the Reel swapped mid-drag.
     state.progressScrubbing = false;
     if (state.progressRoot) {
@@ -958,23 +1094,39 @@
     }
 
     const onTimeUpdate = () => {
-      if (state.progressBar) scheduleProgressTick(video);
+      if (video !== state.activeVideo) return;
+      clearPendingFreshStart(video);
       handleTimeUpdate(video);
     };
-    const onEnded = () => handleEnded(video);
+    const onEnded = () => {
+      if (video !== state.activeVideo) return;
+      cancelProgressTick();
+      handleEnded(video);
+    };
     const onPlay = () => {
-      if (state.progressBar) updateProgressBar(video);
+      if (video !== state.activeVideo) return;
+      clearPendingFreshStart(video);
+      if (state.progressBar) {
+        updateProgressBar(video);
+        startProgressLoop();
+      }
       broadcastStatus();
     };
     const onPause = () => {
+      if (video !== state.activeVideo) return;
+      cancelProgressTick();
       if (state.progressBar) updateProgressBar(video);
       broadcastStatus();
     };
     const onSeeked = () => {
+      if (video !== state.activeVideo) return;
+      clearPendingFreshStart(video);
       if (state.progressBar) updateProgressBar(video);
     };
     const onMeta = () => {
-      if (state.progressBar && state.activeVideo === video) {
+      if (video !== state.activeVideo) return;
+      syncActiveReelSrc(video);
+      if (state.progressBar) {
         updateProgressBar(video);
         positionProgressBar(video);
       }
@@ -1006,6 +1158,7 @@
     });
     if (state.progressBar) {
       updateProgressBar(video);
+      if (!video.paused && !video.ended) startProgressLoop();
       // Async settle only — avoid re-entering bind via syncProgressLayout here.
       clearProgressSettleTimers();
       for (const ms of [50, 150, 350, 700]) {
@@ -1019,6 +1172,17 @@
           }
         }, ms));
       }
+    }
+    // If this Reel was left at EOF (auto-advance then Previous), restart now (#3).
+    // resetPlayCount also does this; calling here covers bind-without-reset races.
+    if (
+      state.autoScroll
+      && !preserveEndState
+      && !sameReel
+      && isNearPlaybackEnd(video)
+      && !state.pendingFreshStart
+    ) {
+      prepareFreshPlayback(video);
     }
     broadcastStatus();
   }
@@ -1047,10 +1211,13 @@
     }
     state.listeners.clear();
     state.activeVideo = null;
+    state.activeReelSrc = '';
   }
 
   function handleTimeUpdate(video) {
     if (!state.active || !state.autoScroll || state.advancing) return;
+    if (video !== state.activeVideo) return;
+    if (state.pendingFreshStart) return;
     if (state.videoEndedFired) return;
     const d = video.duration;
     if (Number.isFinite(d) && d > 0 && video.currentTime >= d - END_THRESHOLD_SECONDS) {
@@ -1058,16 +1225,35 @@
     }
   }
 
+  function schedulePostEndRebind() {
+    setTimeout(() => {
+      if (!state.active) return;
+      refreshActiveVideo({ resetCount: true, allowReelChange: true });
+      syncProgressLayout({ settle: true });
+    }, VIDEO_SETTLE_MS);
+  }
+
   function handleEnded(video) {
+    if (video !== state.activeVideo) return;
+    if (state.pendingFreshStart) return;
+    // Progress-only: Instagram may auto-advance after natural end without a user
+    // scroll event — rebind once the next Reel settles (#4).
+    if (state.progressBar && !state.autoScroll) {
+      schedulePostEndRebind();
+      return;
+    }
     if (!state.active || !state.autoScroll || state.advancing) return;
     onPlayComplete(video);
   }
 
   function onPlayComplete(video) {
     if (!state.autoScroll) return;
+    if (video && video !== state.activeVideo) return;
+    if (state.pendingFreshStart) return;
     if (state.videoEndedFired) return;
     state.videoEndedFired = true;
     state.playCount += 1;
+    syncActiveReelSrc(video);
     log(`Play complete. playCount=${state.playCount} / target=${state.repeatCount}`);
     if (state.progressBar) updateProgressBar(video);
     broadcastStatus();
@@ -1081,9 +1267,16 @@
 
   function replayFromStart(video) {
     state.videoEndedFired = false;
+    const target = resolveReplayVideo(video);
+    if (target && target !== state.activeVideo) bindVideo(target);
+    if (!target) {
+      warn('Failed to find Reel video for replay.');
+      return;
+    }
+    log('Replaying Reel from start.');
     try {
-      video.currentTime = 0;
-      const p = video.play();
+      target.currentTime = 0;
+      const p = target.play();
       if (p && typeof p.then === 'function') {
         p.catch(() => {});
       }
@@ -1092,10 +1285,54 @@
     }
   }
 
+  function isNearPlaybackEnd(video) {
+    if (!video) return false;
+    if (video.ended) return true;
+    const d = video.duration;
+    return Number.isFinite(d) && d > 0 && video.currentTime >= d - END_THRESHOLD_SECONDS;
+  }
+
+  /**
+   * Restart a Reel left at end-of-play (e.g. after auto-advance, then Previous).
+   * Suppresses completion until currentTime leaves the end zone so a stale
+   * timeupdate/ended cannot immediately re-advance (#3).
+   */
+  function prepareFreshPlayback(video) {
+    if (!video) return;
+    state.pendingFreshStart = true;
+    state.videoEndedFired = true;
+    try {
+      video.currentTime = 0;
+      const p = video.play();
+      if (p && typeof p.then === 'function') p.catch(() => {});
+    } catch (_e) {
+      state.pendingFreshStart = false;
+      state.videoEndedFired = false;
+      warn('Failed to restart Reel from start.');
+    }
+  }
+
+  function clearPendingFreshStart(video) {
+    if (!state.pendingFreshStart) return;
+    if (video && video !== state.activeVideo) return;
+    // Seek landed (or Instagram restarted) — arm auto-scroll for a full play.
+    if (!video || !isNearPlaybackEnd(video)) {
+      state.pendingFreshStart = false;
+      state.videoEndedFired = false;
+    }
+  }
+
   function resetPlayCount() {
     state.playCount = 0;
-    state.videoEndedFired = false;
+    state.activeReelSrc = getVideoSrcKey(state.activeVideo);
     log('New Reel detected → counter reset.');
+    // Returning to a Reel still sitting at end-of-play must start a new cycle (#3).
+    if (state.autoScroll && isNearPlaybackEnd(state.activeVideo)) {
+      prepareFreshPlayback(state.activeVideo);
+    } else {
+      state.videoEndedFired = false;
+      state.pendingFreshStart = false;
+    }
     if (state.progressBar) updateProgressBar(state.activeVideo);
     broadcastStatus();
   }
@@ -1135,7 +1372,9 @@
   function afterAdvance() {
     setTimeout(() => {
       if (!state.active) return;
-      refreshActiveVideo({ resetCount: true });
+      refreshActiveVideo({ resetCount: true, allowReelChange: true });
+      // playCount hits repeatCount before advance; src keys may lag on the new Reel.
+      resetPlayCount();
       syncProgressLayout({ settle: true });
     }, VIDEO_SETTLE_MS);
   }
@@ -1240,7 +1479,7 @@
       if (userScrollTimer) clearTimeout(userScrollTimer);
       userScrollTimer = setTimeout(() => {
         const prev = state.activeVideo;
-        refreshActiveVideo({ resetCount: true });
+        refreshActiveVideo({ resetCount: true, allowReelChange: true });
         if (state.progressBar && state.activeVideo === prev) {
           syncProgressLayout({ settle: true });
         }
